@@ -25,6 +25,8 @@ pub enum LlmBackend {
     OpenAiCompatible,
     /// Tinfoil private inference
     Tinfoil,
+    /// x402 payment-authenticated OpenAI-compatible router
+    X402,
 }
 
 impl std::str::FromStr for LlmBackend {
@@ -38,8 +40,9 @@ impl std::str::FromStr for LlmBackend {
             "ollama" => Ok(Self::Ollama),
             "openai_compatible" | "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
             "tinfoil" => Ok(Self::Tinfoil),
+            "x402" => Ok(Self::X402),
             _ => Err(format!(
-                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil",
+                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil, x402",
                 s
             )),
         }
@@ -55,6 +58,7 @@ impl std::fmt::Display for LlmBackend {
             Self::Ollama => write!(f, "ollama"),
             Self::OpenAiCompatible => write!(f, "openai_compatible"),
             Self::Tinfoil => write!(f, "tinfoil"),
+            Self::X402 => write!(f, "x402"),
         }
     }
 }
@@ -95,6 +99,19 @@ pub struct TinfoilConfig {
     pub model: String,
 }
 
+/// Configuration for x402 router integration.
+#[derive(Debug, Clone)]
+pub struct X402Config {
+    pub base_url: String,
+    /// EVM JSON-RPC URL used to read ERC-2612 nonces.
+    pub rpc_url: String,
+    pub private_key: SecretString,
+    pub network: String,
+    /// Permit cap in token base units (USDC has 6 decimals).
+    pub permit_cap: String,
+    pub model: String,
+}
+
 /// LLM provider configuration.
 ///
 /// NEAR AI remains the default backend. Users can switch to other providers
@@ -115,6 +132,8 @@ pub struct LlmConfig {
     pub openai_compatible: Option<OpenAiCompatibleConfig>,
     /// Tinfoil config (populated when backend=tinfoil)
     pub tinfoil: Option<TinfoilConfig>,
+    /// x402 config (populated when backend=x402)
+    pub x402: Option<X402Config>,
 }
 
 /// API mode for NEAR AI.
@@ -336,6 +355,65 @@ impl LlmConfig {
             None
         };
 
+        let x402 = if backend == LlmBackend::X402 {
+            let base_url = optional_env("X402_BASE_URL")?
+                .or_else(|| settings.x402_base_url.clone())
+                .ok_or_else(|| ConfigError::MissingRequired {
+                    key: "X402_BASE_URL".to_string(),
+                    hint: "Set X402_BASE_URL when LLM_BACKEND=x402".to_string(),
+                })?;
+            let rpc_url = optional_env("X402_RPC_URL")?
+                .or_else(|| settings.x402_rpc_url.clone())
+                .unwrap_or_else(|| "https://mainnet.base.org".to_string());
+
+            let raw_key =
+                optional_env("X402_PRIVATE_KEY")?.ok_or_else(|| ConfigError::MissingRequired {
+                    key: "X402_PRIVATE_KEY".to_string(),
+                    hint: "Set X402_PRIVATE_KEY when LLM_BACKEND=x402".to_string(),
+                })?;
+            let private_key =
+                normalize_private_key(&raw_key).ok_or_else(|| ConfigError::InvalidValue {
+                    key: "X402_PRIVATE_KEY".to_string(),
+                    message: "must be 0x-prefixed 64 hex characters".to_string(),
+                })?;
+
+            let network = optional_env("X402_NETWORK")?
+                .or_else(|| settings.x402_network.clone())
+                .unwrap_or_else(|| "eip155:8453".to_string());
+            if network != "eip155:8453" {
+                return Err(ConfigError::InvalidValue {
+                    key: "X402_NETWORK".to_string(),
+                    message: "only eip155:8453 (Base) is supported".to_string(),
+                });
+            }
+
+            let permit_cap = optional_env("X402_PERMIT_CAP")?
+                .or_else(|| settings.x402_permit_cap.clone())
+                .unwrap_or_else(|| "10000000".to_string());
+            let cap_valid = permit_cap.parse::<u128>().map(|n| n > 0).unwrap_or(false);
+            if !cap_valid {
+                return Err(ConfigError::InvalidValue {
+                    key: "X402_PERMIT_CAP".to_string(),
+                    message: "must be a positive integer in base units".to_string(),
+                });
+            }
+
+            let model = optional_env("LLM_MODEL")?
+                .or_else(|| settings.selected_model.clone())
+                .unwrap_or_else(|| "default".to_string());
+
+            Some(X402Config {
+                base_url,
+                rpc_url,
+                private_key: SecretString::from(private_key),
+                network,
+                permit_cap,
+                model,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             backend,
             nearai,
@@ -344,7 +422,32 @@ impl LlmConfig {
             ollama,
             openai_compatible,
             tinfoil,
+            x402,
         })
+    }
+}
+
+/// Normalize and validate a private key as 0x-prefixed 64 hex chars.
+fn normalize_private_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let normalized = if let Some(rest) = trimmed.strip_prefix("0X") {
+        format!("0x{rest}")
+    } else {
+        trimmed.to_string()
+    };
+
+    if normalized.len() != 66 || !normalized.starts_with("0x") {
+        return None;
+    }
+    if normalized
+        .as_bytes()
+        .iter()
+        .skip(2)
+        .all(|b| b.is_ascii_hexdigit())
+    {
+        Some(normalized)
+    } else {
+        None
     }
 }
 
@@ -359,11 +462,8 @@ fn default_session_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ENV_MUTEX, clear_injected_vars_for_tests};
     use crate::settings::Settings;
-    use std::sync::Mutex;
-
-    /// Serializes env-mutating tests to prevent parallel races.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Clear all openai-compatible-related env vars.
     fn clear_openai_compatible_env() {
@@ -373,6 +473,22 @@ mod tests {
             std::env::remove_var("LLM_BASE_URL");
             std::env::remove_var("LLM_MODEL");
         }
+        clear_injected_vars_for_tests();
+    }
+
+    /// Clear all x402-related env vars.
+    fn clear_x402_env() {
+        // SAFETY: Only called under ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("X402_BASE_URL");
+            std::env::remove_var("X402_PRIVATE_KEY");
+            std::env::remove_var("X402_RPC_URL");
+            std::env::remove_var("X402_NETWORK");
+            std::env::remove_var("X402_PERMIT_CAP");
+            std::env::remove_var("LLM_MODEL");
+        }
+        clear_injected_vars_for_tests();
     }
 
     #[test]
@@ -422,5 +538,95 @@ mod tests {
         unsafe {
             std::env::remove_var("LLM_MODEL");
         }
+    }
+
+    #[test]
+    fn x402_resolves_from_env() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_x402_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "x402");
+            std::env::set_var("X402_BASE_URL", "https://router.example.com");
+            std::env::set_var(
+                "X402_PRIVATE_KEY",
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            );
+            std::env::set_var("X402_NETWORK", "eip155:8453");
+            std::env::set_var("X402_PERMIT_CAP", "10000000");
+            std::env::set_var("LLM_MODEL", "x402/model");
+        }
+
+        let settings = Settings::default();
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let x402 = cfg.x402.expect("x402 config should be present");
+
+        assert_eq!(cfg.backend, LlmBackend::X402);
+        assert_eq!(x402.base_url, "https://router.example.com");
+        assert_eq!(x402.rpc_url, "https://mainnet.base.org");
+        assert_eq!(x402.network, "eip155:8453");
+        assert_eq!(x402.permit_cap, "10000000");
+        assert_eq!(x402.model, "x402/model");
+
+        clear_x402_env();
+    }
+
+    #[test]
+    fn x402_missing_private_key_fails() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_x402_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "x402");
+            std::env::set_var("X402_BASE_URL", "https://router.example.com");
+        }
+
+        let settings = Settings::default();
+        let err = LlmConfig::resolve(&settings).expect_err("resolve should fail");
+
+        match err {
+            ConfigError::MissingRequired { key, .. } => assert_eq!(key, "X402_PRIVATE_KEY"),
+            other => panic!("unexpected error type: {other:?}"),
+        }
+
+        clear_x402_env();
+    }
+
+    #[test]
+    fn x402_resolves_from_settings_when_env_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_x402_env();
+
+        let settings = Settings {
+            llm_backend: Some("x402".to_string()),
+            x402_base_url: Some("https://router.example.com".to_string()),
+            x402_rpc_url: Some("https://mainnet.base.org".to_string()),
+            x402_network: Some("eip155:8453".to_string()),
+            x402_permit_cap: Some("10000000".to_string()),
+            selected_model: Some("x402/model-from-settings".to_string()),
+            ..Default::default()
+        };
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var(
+                "X402_PRIVATE_KEY",
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            );
+        }
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let x402 = cfg.x402.expect("x402 config should be present");
+
+        assert_eq!(cfg.backend, LlmBackend::X402);
+        assert_eq!(x402.base_url, "https://router.example.com");
+        assert_eq!(x402.rpc_url, "https://mainnet.base.org");
+        assert_eq!(x402.network, "eip155:8453");
+        assert_eq!(x402.permit_cap, "10000000");
+        assert_eq!(x402.model, "x402/model-from-settings");
+
+        clear_x402_env();
     }
 }

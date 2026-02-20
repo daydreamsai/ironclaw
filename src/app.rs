@@ -777,3 +777,175 @@ impl AppBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "libsql")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "libsql")]
+    use secrecy::{ExposeSecret, SecretString};
+
+    #[cfg(feature = "libsql")]
+    use super::{AppBuilder, AppBuilderFlags};
+    #[cfg(feature = "libsql")]
+    use crate::channels::web::log_layer::LogBroadcaster;
+    #[cfg(feature = "libsql")]
+    use crate::config::{self, Config, LlmBackend};
+    #[cfg(feature = "libsql")]
+    use crate::db::{Database as _, SettingsStore as _};
+    #[cfg(feature = "libsql")]
+    use crate::llm::{SessionConfig, SessionManager};
+    #[cfg(feature = "libsql")]
+    use crate::secrets::{
+        CreateSecretParams, LibSqlSecretsStore, SecretsCrypto, SecretsStore as _,
+    };
+
+    #[cfg(feature = "libsql")]
+    fn clear_test_env() {
+        // SAFETY: Calls are serialized with ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("DATABASE_BACKEND");
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("LIBSQL_PATH");
+            std::env::remove_var("SECRETS_MASTER_KEY");
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("LLM_MODEL");
+            std::env::remove_var("X402_BASE_URL");
+            std::env::remove_var("X402_PRIVATE_KEY");
+            std::env::remove_var("X402_RPC_URL");
+            std::env::remove_var("X402_NETWORK");
+            std::env::remove_var("X402_PERMIT_CAP");
+        }
+        config::clear_injected_vars_for_tests();
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn seed_x402_db_state(db_path: &std::path::Path, master_key: &str) {
+        let backend = crate::db::libsql::LibSqlBackend::new_local(db_path)
+            .await
+            .expect("create seed libsql backend");
+        backend.run_migrations().await.expect("run seed migrations");
+
+        backend
+            .set_setting("default", "llm_backend", &serde_json::json!("x402"))
+            .await
+            .expect("set llm_backend");
+        backend
+            .set_setting(
+                "default",
+                "x402_base_url",
+                &serde_json::json!("https://router.example.com/v1"),
+            )
+            .await
+            .expect("set x402_base_url");
+        backend
+            .set_setting(
+                "default",
+                "x402_rpc_url",
+                &serde_json::json!("https://mainnet.base.org"),
+            )
+            .await
+            .expect("set x402_rpc_url");
+        backend
+            .set_setting("default", "x402_network", &serde_json::json!("eip155:8453"))
+            .await
+            .expect("set x402_network");
+        backend
+            .set_setting("default", "x402_permit_cap", &serde_json::json!("10000000"))
+            .await
+            .expect("set x402_permit_cap");
+        backend
+            .set_setting(
+                "default",
+                "selected_model",
+                &serde_json::json!("x402/model"),
+            )
+            .await
+            .expect("set selected_model");
+
+        let crypto = Arc::new(
+            SecretsCrypto::new(SecretString::from(master_key.to_string()))
+                .expect("create secrets crypto"),
+        );
+        let secrets = LibSqlSecretsStore::new(backend.shared_db(), crypto);
+        secrets
+            .create(
+                "default",
+                CreateSecretParams::new(
+                    "llm_x402_private_key",
+                    "0x1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+            )
+            .await
+            .expect("seed x402 private key secret");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn app_builder_reloads_x402_after_init_secrets() {
+        let _guard = config::ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_test_env();
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = temp_dir.path().join("app_builder_x402.db");
+        let session_path = temp_dir.path().join("session.json");
+        let master_key = "0123456789abcdef0123456789abcdef";
+
+        seed_x402_db_state(&db_path, master_key).await;
+
+        // SAFETY: Calls are serialized with ENV_MUTEX in tests.
+        unsafe {
+            std::env::set_var("HOME", temp_dir.path());
+            std::env::set_var("DATABASE_BACKEND", "libsql");
+            std::env::set_var("LIBSQL_PATH", db_path.to_string_lossy().to_string());
+            std::env::set_var("SECRETS_MASTER_KEY", master_key);
+        }
+
+        let config = Config::from_env_with_toml(None)
+            .await
+            .expect("load baseline env config");
+        assert_ne!(config.llm.backend, LlmBackend::X402);
+
+        let session = Arc::new(SessionManager::new(SessionConfig {
+            auth_base_url: "https://private.near.ai".to_string(),
+            session_path,
+        }));
+        let mut builder = AppBuilder::new(
+            config,
+            AppBuilderFlags::default(),
+            None,
+            session,
+            Arc::new(LogBroadcaster::new()),
+        );
+
+        builder
+            .init_database()
+            .await
+            .expect("init_database should succeed");
+        // Missing X402_PRIVATE_KEY at DB reload time -> keep env-based config.
+        assert_ne!(builder.config.llm.backend, LlmBackend::X402);
+
+        builder
+            .init_secrets()
+            .await
+            .expect("init_secrets should succeed");
+        assert_eq!(builder.config.llm.backend, LlmBackend::X402);
+        let x402 = builder
+            .config
+            .llm
+            .x402
+            .as_ref()
+            .expect("x402 config should be present after secret injection");
+        assert_eq!(x402.base_url, "https://router.example.com/v1");
+        assert_eq!(x402.network, "eip155:8453");
+        assert_eq!(x402.permit_cap, "10000000");
+        assert_eq!(
+            x402.private_key.expose_secret(),
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        clear_test_env();
+    }
+}

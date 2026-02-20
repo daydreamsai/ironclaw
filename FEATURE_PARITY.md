@@ -220,6 +220,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | NVIDIA API | ✅ | ❌ | P3 | New provider |
 | OpenRouter | ✅ | ✅ | - | Via OpenAI-compatible provider (RigAdapter) |
 | Tinfoil | ❌ | ✅ | - | Private inference provider (IronClaw-only) |
+| x402 router (Base USDC) | ❌ | 🚧 | P2 | Outbound provider with `PAYMENT-SIGNATURE` + permit auth |
 | OpenAI-compatible | ❌ | ✅ | - | Generic OpenAI-compatible endpoint (RigAdapter) |
 | Ollama (local) | ✅ | ✅ | - | via `rig::providers::ollama` (full support) |
 | Perplexity | ✅ | ❌ | P3 | Freshness parameter for web_search |

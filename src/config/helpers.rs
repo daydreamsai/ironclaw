@@ -1,6 +1,6 @@
 use crate::error::ConfigError;
 
-use super::INJECTED_VARS;
+use super::injected_vars;
 
 pub(crate) fn optional_env(key: &str) -> Result<Option<String>, ConfigError> {
     // Check real env vars first (always win over injected secrets)
@@ -16,7 +16,9 @@ pub(crate) fn optional_env(key: &str) -> Result<Option<String>, ConfigError> {
     }
 
     // Fall back to thread-safe overlay (secrets injected from DB)
-    if let Some(val) = INJECTED_VARS.get().and_then(|map| map.get(key)) {
+    if let Ok(vars) = injected_vars().read()
+        && let Some(val) = vars.get(key)
+    {
         return Ok(Some(val.clone()));
     }
 

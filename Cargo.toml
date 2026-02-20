@@ -134,6 +134,9 @@ http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
 mime_guess = "2.0.5"
+hex = "0.4"
+sha3 = "0.10"
+secp256k1 = { version = "0.30", features = ["recovery"] }
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]

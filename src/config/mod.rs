@@ -22,7 +22,7 @@ mod tunnel;
 mod wasm;
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::error::ConfigError;
 use crate::settings::Settings;
@@ -36,7 +36,7 @@ pub use self::embeddings::EmbeddingsConfig;
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::llm::{
     AnthropicDirectConfig, LlmBackend, LlmConfig, NearAiApiMode, NearAiConfig, OllamaConfig,
-    OpenAiCompatibleConfig, OpenAiDirectConfig, TinfoilConfig,
+    OpenAiCompatibleConfig, OpenAiDirectConfig, TinfoilConfig, X402Config,
 };
 pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;
@@ -51,7 +51,21 @@ pub use self::wasm::WasmConfig;
 /// Used by `inject_llm_keys_from_secrets()` to make API keys available to
 /// `optional_env()` without unsafe `set_var` calls. `optional_env()` checks
 /// real env vars first, then falls back to this overlay.
-static INJECTED_VARS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static INJECTED_VARS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+pub(super) fn injected_vars() -> &'static RwLock<HashMap<String, String>> {
+    INJECTED_VARS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn clear_injected_vars_for_tests() {
+    if let Ok(mut vars) = injected_vars().write() {
+        vars.clear();
+    }
+}
 
 /// Main configuration for the agent.
 #[derive(Debug, Clone)]
@@ -215,6 +229,7 @@ pub async fn inject_llm_keys_from_secrets(
         ("llm_openai_api_key", "OPENAI_API_KEY"),
         ("llm_anthropic_api_key", "ANTHROPIC_API_KEY"),
         ("llm_compatible_api_key", "LLM_API_KEY"),
+        ("llm_x402_private_key", "X402_PRIVATE_KEY"),
     ];
 
     let mut injected = HashMap::new();
@@ -235,5 +250,177 @@ pub async fn inject_llm_keys_from_secrets(
         }
     }
 
-    let _ = INJECTED_VARS.set(injected);
+    if let Ok(mut vars) = injected_vars().write() {
+        *vars = injected;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use secrecy::{ExposeSecret, SecretString};
+
+    use super::{Config, clear_injected_vars_for_tests, inject_llm_keys_from_secrets};
+    use crate::config::ENV_MUTEX;
+    use crate::db::SettingsStore;
+    use crate::error::{ConfigError, DatabaseError};
+    use crate::history::SettingRow;
+    use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto, SecretsStore};
+
+    struct MockSettingsStore {
+        settings: HashMap<String, serde_json::Value>,
+    }
+
+    impl MockSettingsStore {
+        fn new(settings: HashMap<String, serde_json::Value>) -> Self {
+            Self { settings }
+        }
+    }
+
+    #[async_trait]
+    impl SettingsStore for MockSettingsStore {
+        async fn get_setting(
+            &self,
+            _user_id: &str,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, DatabaseError> {
+            Ok(self.settings.get(key).cloned())
+        }
+
+        async fn get_setting_full(
+            &self,
+            _user_id: &str,
+            _key: &str,
+        ) -> Result<Option<SettingRow>, DatabaseError> {
+            Ok(None)
+        }
+
+        async fn set_setting(
+            &self,
+            _user_id: &str,
+            _key: &str,
+            _value: &serde_json::Value,
+        ) -> Result<(), DatabaseError> {
+            Err(DatabaseError::Query(
+                "set_setting not implemented in mock".to_string(),
+            ))
+        }
+
+        async fn delete_setting(&self, _user_id: &str, _key: &str) -> Result<bool, DatabaseError> {
+            Err(DatabaseError::Query(
+                "delete_setting not implemented in mock".to_string(),
+            ))
+        }
+
+        async fn list_settings(&self, _user_id: &str) -> Result<Vec<SettingRow>, DatabaseError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_all_settings(
+            &self,
+            _user_id: &str,
+        ) -> Result<HashMap<String, serde_json::Value>, DatabaseError> {
+            Ok(self.settings.clone())
+        }
+
+        async fn set_all_settings(
+            &self,
+            _user_id: &str,
+            _settings: &HashMap<String, serde_json::Value>,
+        ) -> Result<(), DatabaseError> {
+            Err(DatabaseError::Query(
+                "set_all_settings not implemented in mock".to_string(),
+            ))
+        }
+
+        async fn has_settings(&self, _user_id: &str) -> Result<bool, DatabaseError> {
+            Ok(!self.settings.is_empty())
+        }
+    }
+
+    fn clear_test_env() {
+        // SAFETY: Calls are serialized with ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("DATABASE_BACKEND");
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("LLM_MODEL");
+            std::env::remove_var("X402_BASE_URL");
+            std::env::remove_var("X402_PRIVATE_KEY");
+            std::env::remove_var("X402_RPC_URL");
+            std::env::remove_var("X402_NETWORK");
+            std::env::remove_var("X402_PERMIT_CAP");
+        }
+        clear_injected_vars_for_tests();
+    }
+
+    fn test_secret_store() -> InMemorySecretsStore {
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        InMemorySecretsStore::new(crypto)
+    }
+
+    #[tokio::test]
+    async fn x402_db_reload_succeeds_after_secret_injection() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_test_env();
+
+        // SAFETY: Calls are serialized with ENV_MUTEX in tests.
+        unsafe {
+            std::env::set_var("DATABASE_BACKEND", "libsql");
+        }
+
+        let mut settings = HashMap::new();
+        settings.insert("llm_backend".to_string(), serde_json::json!("x402"));
+        settings.insert(
+            "x402_base_url".to_string(),
+            serde_json::json!("https://router.example.com/v1"),
+        );
+        settings.insert(
+            "x402_rpc_url".to_string(),
+            serde_json::json!("https://mainnet.base.org"),
+        );
+        settings.insert("x402_network".to_string(), serde_json::json!("eip155:8453"));
+        settings.insert("x402_permit_cap".to_string(), serde_json::json!("10000000"));
+        settings.insert(
+            "selected_model".to_string(),
+            serde_json::json!("x402/model"),
+        );
+        let db = MockSettingsStore::new(settings);
+
+        let err = Config::from_db_with_toml(&db, "default", None)
+            .await
+            .expect_err("x402 config should fail before key injection");
+        match err {
+            ConfigError::MissingRequired { key, .. } => assert_eq!(key, "X402_PRIVATE_KEY"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let secrets = test_secret_store();
+        let key = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        secrets
+            .create(
+                "default",
+                CreateSecretParams::new("llm_x402_private_key", key),
+            )
+            .await
+            .expect("should store x402 private key");
+
+        inject_llm_keys_from_secrets(&secrets, "default").await;
+
+        let config = Config::from_db_with_toml(&db, "default", None)
+            .await
+            .expect("x402 config should resolve after key injection");
+        assert_eq!(config.llm.backend, crate::config::LlmBackend::X402);
+        let x402 = config.llm.x402.expect("x402 config should be present");
+        assert_eq!(x402.base_url, "https://router.example.com/v1");
+        assert_eq!(x402.network, "eip155:8453");
+        assert_eq!(x402.permit_cap, "10000000");
+        assert_eq!(x402.private_key.expose_secret(), key);
+
+        clear_test_env();
+    }
 }

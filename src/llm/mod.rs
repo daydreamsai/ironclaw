@@ -18,6 +18,7 @@ pub mod response_cache;
 mod retry;
 mod rig_adapter;
 pub mod session;
+mod x402;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use failover::{CooldownConfig, FailoverProvider};
@@ -34,6 +35,7 @@ pub use reasoning::{
 pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
+pub use x402::X402Provider;
 
 use std::sync::Arc;
 
@@ -59,6 +61,7 @@ pub fn create_llm_provider(
         LlmBackend::Ollama => create_ollama_provider(config),
         LlmBackend::OpenAiCompatible => create_openai_compatible_provider(config),
         LlmBackend::Tinfoil => create_tinfoil_provider(config),
+        LlmBackend::X402 => create_x402_provider(config),
     }
 }
 
@@ -225,6 +228,20 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
     Ok(Arc::new(RigAdapter::new(model, &compat.model)))
 }
 
+fn create_x402_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let x402 = config.x402.as_ref().ok_or_else(|| LlmError::AuthFailed {
+        provider: "x402".to_string(),
+    })?;
+
+    tracing::info!(
+        "Using x402 router endpoint (base_url: {}, model: {}, network: {})",
+        x402.base_url,
+        x402.model,
+        x402.network
+    );
+    Ok(Arc::new(X402Provider::new(x402.clone())?))
+}
+
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
 ///
 /// Uses `NEARAI_CHEAP_MODEL` if set, otherwise falls back to the main provider.
@@ -295,6 +312,7 @@ mod tests {
             ollama: None,
             openai_compatible: None,
             tinfoil: None,
+            x402: None,
         }
     }
 

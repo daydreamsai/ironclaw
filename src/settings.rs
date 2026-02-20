@@ -41,7 +41,7 @@ pub struct Settings {
     pub secrets_master_key_source: KeySource,
 
     // === Step 3: Inference Provider ===
-    /// LLM backend: "nearai", "anthropic", "openai", "ollama", "openai_compatible".
+    /// LLM backend: "nearai", "anthropic", "openai", "ollama", "openai_compatible", "x402".
     #[serde(default)]
     pub llm_backend: Option<String>,
 
@@ -52,6 +52,22 @@ pub struct Settings {
     /// OpenAI-compatible endpoint base URL (when llm_backend = "openai_compatible").
     #[serde(default)]
     pub openai_compatible_base_url: Option<String>,
+
+    /// x402 router base URL (when llm_backend = "x402").
+    #[serde(default)]
+    pub x402_base_url: Option<String>,
+
+    /// EVM RPC URL for nonce reads (when llm_backend = "x402").
+    #[serde(default)]
+    pub x402_rpc_url: Option<String>,
+
+    /// x402 network identifier (currently Base only: "eip155:8453").
+    #[serde(default)]
+    pub x402_network: Option<String>,
+
+    /// x402 permit cap in token base units (USDC has 6 decimals).
+    #[serde(default)]
+    pub x402_permit_cap: Option<String>,
 
     // === Step 4: Model Selection ===
     /// Currently selected model.
@@ -560,35 +576,28 @@ impl Settings {
         // The settings table stores both Settings struct fields and app-specific
         // data (e.g. nearai.session_token). Skip keys that don't correspond to
         // a known Settings path.
-        let mut settings = Self::default();
+        let mut settings_json = match serde_json::to_value(Self::default()) {
+            Ok(v) => v,
+            Err(_) => return Self::default(),
+        };
 
         for (key, value) in map {
-            // Convert the JSONB value to a string for the existing set() method
-            let value_str = match value {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Null => continue, // null means default, skip
-                other => other.to_string(),
-            };
+            if value.is_null() {
+                continue; // null means default, skip
+            }
 
-            match settings.set(key, &value_str) {
+            match set_json_path(&mut settings_json, key, value.clone()) {
                 Ok(()) => {}
                 // The settings table stores both Settings fields and app-specific
                 // data (e.g. nearai.session_token). Silently skip unknown paths.
                 Err(e) if e.starts_with("Path not found") => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to apply DB setting '{}' = '{}': {}",
-                        key,
-                        value_str,
-                        e
-                    );
+                    tracing::warn!("Failed to apply DB setting '{}' = '{}': {}", key, value, e);
                 }
             }
         }
 
-        settings
+        serde_json::from_value(settings_json).unwrap_or_default()
     }
 
     /// Flatten Settings into a key-value map suitable for DB storage.
@@ -884,6 +893,34 @@ fn collect_settings(
     }
 }
 
+fn set_json_path(
+    root: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return Err("Empty path".to_string());
+    }
+
+    let mut current = root;
+    for part in &parts[..parts.len() - 1] {
+        current = current
+            .get_mut(*part)
+            .ok_or_else(|| format!("Path not found: {}", path))?;
+    }
+
+    let final_key = parts.last().unwrap();
+    let obj = current
+        .as_object_mut()
+        .ok_or_else(|| format!("Parent is not an object: {}", path))?;
+    if !obj.contains_key(*final_key) {
+        return Err(format!("Path not found: {}", path));
+    }
+    obj.insert((*final_key).to_string(), value);
+    Ok(())
+}
+
 /// Recursively merge `other` into `target`, but only for fields where
 /// `other` differs from `defaults`. This means only explicitly-set values
 /// in the TOML file override the base settings.
@@ -1083,6 +1120,65 @@ mod tests {
             !restored.embeddings.enabled,
             "embeddings.enabled=false must survive DB round-trip"
         );
+    }
+
+    #[test]
+    fn test_x402_settings_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let settings = Settings {
+            llm_backend: Some("x402".to_string()),
+            x402_base_url: Some("https://router.example.com".to_string()),
+            x402_rpc_url: Some("https://mainnet.base.org".to_string()),
+            x402_network: Some("eip155:8453".to_string()),
+            x402_permit_cap: Some("10000000".to_string()),
+            selected_model: Some("router/model".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.llm_backend, Some("x402".to_string()));
+        assert_eq!(
+            loaded.x402_base_url,
+            Some("https://router.example.com".to_string())
+        );
+        assert_eq!(
+            loaded.x402_rpc_url,
+            Some("https://mainnet.base.org".to_string())
+        );
+        assert_eq!(loaded.x402_network, Some("eip155:8453".to_string()));
+        assert_eq!(loaded.x402_permit_cap, Some("10000000".to_string()));
+    }
+
+    #[test]
+    fn test_x402_db_map_round_trip() {
+        let settings = Settings {
+            llm_backend: Some("x402".to_string()),
+            x402_base_url: Some("https://router.example.com".to_string()),
+            x402_rpc_url: Some("https://mainnet.base.org".to_string()),
+            x402_network: Some("eip155:8453".to_string()),
+            x402_permit_cap: Some("10000000".to_string()),
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert_eq!(restored.llm_backend, Some("x402".to_string()));
+        assert_eq!(
+            restored.x402_base_url,
+            Some("https://router.example.com".to_string())
+        );
+        assert_eq!(
+            restored.x402_rpc_url,
+            Some("https://mainnet.base.org".to_string())
+        );
+        assert_eq!(restored.x402_network, Some("eip155:8453".to_string()));
+        assert_eq!(restored.x402_permit_cap, Some("10000000".to_string()));
     }
 
     #[test]

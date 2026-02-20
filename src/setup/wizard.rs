@@ -3,7 +3,7 @@
 //! The wizard guides users through:
 //! 1. Database connection
 //! 2. Security (secrets master key)
-//! 3. Inference provider (NEAR AI, Anthropic, OpenAI, Ollama, OpenAI-compatible)
+//! 3. Inference provider (NEAR AI, Anthropic, OpenAI, Ollama, OpenAI-compatible, x402)
 //! 4. Model selection
 //! 5. Embeddings
 //! 6. Channel configuration
@@ -601,21 +601,11 @@ impl SetupWizard {
     async fn step_inference_provider(&mut self) -> Result<(), SetupError> {
         // Show current provider if already configured
         if let Some(ref current) = self.settings.llm_backend {
-            let display = match current.as_str() {
-                "nearai" => "NEAR AI",
-                "anthropic" => "Anthropic (Claude)",
-                "openai" => "OpenAI",
-                "ollama" => "Ollama (local)",
-                "openai_compatible" => "OpenAI-compatible endpoint",
-                other => other,
-            };
+            let display = llm_provider_display(current);
             print_info(&format!("Current provider: {}", display));
             println!();
 
-            let is_known = matches!(
-                current.as_str(),
-                "nearai" | "anthropic" | "openai" | "ollama" | "openai_compatible"
-            );
+            let is_known = is_supported_inference_provider(current);
 
             if is_known && confirm("Keep current provider?", true).map_err(SetupError::Io)? {
                 // Still run the auth sub-flow in case they need to update keys
@@ -625,6 +615,7 @@ impl SetupWizard {
                     "openai" => return self.setup_openai().await,
                     "ollama" => return self.setup_ollama(),
                     "openai_compatible" => return self.setup_openai_compatible().await,
+                    "x402" => return self.setup_x402().await,
                     _ => {
                         return Err(SetupError::Config(format!(
                             "Unhandled provider: {}",
@@ -651,6 +642,7 @@ impl SetupWizard {
             "OpenAI           - GPT models (direct API key)",
             "Ollama           - local models, no API key needed",
             "OpenAI-compatible - custom endpoint (vLLM, LiteLLM, Together, etc.)",
+            "x402 router      - Base USDC payment auth via ERC-2612 permit",
         ];
 
         let choice = select_one("Provider:", options).map_err(SetupError::Io)?;
@@ -661,6 +653,7 @@ impl SetupWizard {
             2 => self.setup_openai().await?,
             3 => self.setup_ollama()?,
             4 => self.setup_openai_compatible().await?,
+            5 => self.setup_x402().await?,
             _ => return Err(SetupError::Config("Invalid provider selection".to_string())),
         }
 
@@ -875,6 +868,112 @@ impl SetupWizard {
         Ok(())
     }
 
+    /// x402 router setup: base URL + RPC URL + permit cap + EVM private key (saved in secrets).
+    async fn setup_x402(&mut self) -> Result<(), SetupError> {
+        self.settings.llm_backend = Some("x402".to_string());
+        if self.settings.selected_model.is_some() {
+            self.settings.selected_model = None;
+        }
+
+        let existing_base_url = self
+            .settings
+            .x402_base_url
+            .clone()
+            .or_else(|| std::env::var("X402_BASE_URL").ok());
+        let base_url = if let Some(ref existing) = existing_base_url {
+            let next = optional_input("Router base URL", Some(&format!("current: {}", existing)))
+                .map_err(SetupError::Io)?;
+            next.unwrap_or_else(|| existing.clone())
+        } else {
+            input("Router base URL (e.g., https://router.example.com)").map_err(SetupError::Io)?
+        };
+
+        if base_url.trim().is_empty() {
+            return Err(SetupError::Config(
+                "Router base URL is required".to_string(),
+            ));
+        }
+        let base_url = normalize_router_base_url(&base_url)
+            .ok_or_else(|| SetupError::Config("Invalid router base URL".to_string()))?;
+        self.settings.x402_base_url = Some(base_url.clone());
+
+        let rpc_default = self
+            .settings
+            .x402_rpc_url
+            .clone()
+            .or_else(|| std::env::var("X402_RPC_URL").ok())
+            .unwrap_or_else(|| "https://mainnet.base.org".to_string());
+        let rpc_input = optional_input("Base RPC URL", Some(&format!("default: {}", rpc_default)))
+            .map_err(SetupError::Io)?;
+        let rpc_url = rpc_input.unwrap_or(rpc_default);
+        if !is_valid_http_url(&rpc_url) {
+            return Err(SetupError::Config("Invalid X402 RPC URL".to_string()));
+        }
+        self.settings.x402_rpc_url = Some(rpc_url.clone());
+
+        let cap_default = self
+            .settings
+            .x402_permit_cap
+            .clone()
+            .or_else(|| std::env::var("X402_PERMIT_CAP").ok())
+            .unwrap_or_else(|| "10000000".to_string());
+        let cap_input = optional_input(
+            "Permit cap (USDC base units, 6 decimals)",
+            Some(&format!("default: {}", cap_default)),
+        )
+        .map_err(SetupError::Io)?;
+        let permit_cap = cap_input.unwrap_or(cap_default);
+        let cap_valid = permit_cap.parse::<u128>().map(|n| n > 0).unwrap_or(false);
+        if !cap_valid {
+            return Err(SetupError::Config(
+                "Permit cap must be a positive integer".to_string(),
+            ));
+        }
+        self.settings.x402_permit_cap = Some(permit_cap.clone());
+
+        // Base-only for this initial implementation.
+        self.settings.x402_network = Some("eip155:8453".to_string());
+
+        if let Ok(existing) = std::env::var("X402_PRIVATE_KEY")
+            && normalize_evm_private_key(&existing).is_some()
+            && confirm("Use X402_PRIVATE_KEY from environment?", true).map_err(SetupError::Io)?
+        {
+            let key = SecretString::from(existing);
+            if let Ok(ctx) = self.init_secrets_context().await {
+                ctx.save_secret("llm_x402_private_key", &key)
+                    .await
+                    .map_err(|e| {
+                        SetupError::Config(format!("Failed to save x402 private key: {}", e))
+                    })?;
+                print_success("x402 private key encrypted and saved");
+            }
+            print_success(&format!("x402 router configured ({})", base_url));
+            return Ok(());
+        }
+
+        let key = secret_input("EVM private key (0x-prefixed 64 hex)").map_err(SetupError::Io)?;
+        let normalized = normalize_evm_private_key(key.expose_secret()).ok_or_else(|| {
+            SetupError::Config(
+                "Invalid private key format (expected 0x + 64 hex chars)".to_string(),
+            )
+        })?;
+
+        if let Ok(ctx) = self.init_secrets_context().await {
+            let key = SecretString::from(normalized);
+            ctx.save_secret("llm_x402_private_key", &key)
+                .await
+                .map_err(|e| {
+                    SetupError::Config(format!("Failed to save x402 private key: {}", e))
+                })?;
+            print_success("x402 private key encrypted and saved");
+        } else {
+            print_info("Secrets not available. Set X402_PRIVATE_KEY in your environment.");
+        }
+
+        print_success(&format!("x402 router configured ({})", base_url));
+        Ok(())
+    }
+
     /// Step 4: Model selection.
     ///
     /// Branches on the selected LLM backend and fetches models from the
@@ -935,6 +1034,16 @@ impl SetupWizard {
                 }
                 self.settings.selected_model = Some(model_id.clone());
                 print_success(&format!("Selected {}", model_id));
+            }
+            "x402" => {
+                // Router model IDs are deployment-specific; ask directly.
+                let model_id =
+                    input("Model name (as exposed by your x402 router)").map_err(SetupError::Io)?;
+                if model_id.trim().is_empty() {
+                    return Err(SetupError::Config("Model name is required".to_string()));
+                }
+                self.settings.selected_model = Some(model_id.trim().to_string());
+                print_success(&format!("Selected {}", model_id.trim()));
             }
             _ => {
                 // NEAR AI: use existing provider list_models()
@@ -1035,6 +1144,7 @@ impl SetupWizard {
             ollama: None,
             openai_compatible: None,
             tinfoil: None,
+            x402: None,
         };
 
         match create_llm_provider(&config, session) {
@@ -1453,6 +1563,54 @@ impl SetupWizard {
         Ok(())
     }
 
+    fn collect_bootstrap_env_vars(&self) -> Vec<(&str, String)> {
+        let mut env_vars: Vec<(&str, String)> = Vec::new();
+
+        if let Some(ref backend) = self.settings.database_backend {
+            env_vars.push(("DATABASE_BACKEND", backend.clone()));
+        }
+        if let Some(ref url) = self.settings.database_url {
+            env_vars.push(("DATABASE_URL", url.clone()));
+        }
+        if let Some(ref path) = self.settings.libsql_path {
+            env_vars.push(("LIBSQL_PATH", path.clone()));
+        }
+        if let Some(ref url) = self.settings.libsql_url {
+            env_vars.push(("LIBSQL_URL", url.clone()));
+        }
+
+        // For key-based x402, keep backend selection in DB and secrets to avoid
+        // requiring plaintext private keys in bootstrap .env during early init.
+        if let Some(ref backend) = self.settings.llm_backend
+            && backend != "x402"
+        {
+            env_vars.push(("LLM_BACKEND", backend.clone()));
+        }
+        if let Some(ref url) = self.settings.openai_compatible_base_url {
+            env_vars.push(("LLM_BASE_URL", url.clone()));
+        }
+        if let Some(ref url) = self.settings.ollama_base_url {
+            env_vars.push(("OLLAMA_BASE_URL", url.clone()));
+        }
+
+        if self.settings.llm_backend.as_deref() == Some("x402") {
+            if let Some(ref url) = self.settings.x402_base_url {
+                env_vars.push(("X402_BASE_URL", url.clone()));
+            }
+            if let Some(ref url) = self.settings.x402_rpc_url {
+                env_vars.push(("X402_RPC_URL", url.clone()));
+            }
+            if let Some(ref network) = self.settings.x402_network {
+                env_vars.push(("X402_NETWORK", network.clone()));
+            }
+            if let Some(ref cap) = self.settings.x402_permit_cap {
+                env_vars.push(("X402_PERMIT_CAP", cap.clone()));
+            }
+        }
+
+        env_vars
+    }
+
     /// Save settings to the database and `~/.ironclaw/.env`, then print summary.
     async fn save_and_summarize(&mut self) -> Result<(), SetupError> {
         self.settings.onboard_completed = true;
@@ -1515,33 +1673,7 @@ impl SetupWizard {
         // These are the chicken-and-egg settings: we need them to decide
         // which database to connect to, so they can't live in the database.
         {
-            let mut env_vars: Vec<(&str, String)> = Vec::new();
-
-            if let Some(ref backend) = self.settings.database_backend {
-                env_vars.push(("DATABASE_BACKEND", backend.clone()));
-            }
-            if let Some(ref url) = self.settings.database_url {
-                env_vars.push(("DATABASE_URL", url.clone()));
-            }
-            if let Some(ref path) = self.settings.libsql_path {
-                env_vars.push(("LIBSQL_PATH", path.clone()));
-            }
-            if let Some(ref url) = self.settings.libsql_url {
-                env_vars.push(("LIBSQL_URL", url.clone()));
-            }
-
-            // LLM bootstrap vars: same chicken-and-egg problem as DATABASE_BACKEND.
-            // Config::from_env() needs the backend before the DB is connected.
-            if let Some(ref backend) = self.settings.llm_backend {
-                env_vars.push(("LLM_BACKEND", backend.clone()));
-            }
-            if let Some(ref url) = self.settings.openai_compatible_base_url {
-                env_vars.push(("LLM_BASE_URL", url.clone()));
-            }
-            if let Some(ref url) = self.settings.ollama_base_url {
-                env_vars.push(("OLLAMA_BASE_URL", url.clone()));
-            }
-
+            let env_vars = self.collect_bootstrap_env_vars();
             if !env_vars.is_empty() {
                 let pairs: Vec<(&str, &str)> =
                     env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1592,15 +1724,7 @@ impl SetupWizard {
         }
 
         if let Some(ref provider) = self.settings.llm_backend {
-            let display = match provider.as_str() {
-                "nearai" => "NEAR AI",
-                "anthropic" => "Anthropic",
-                "openai" => "OpenAI",
-                "ollama" => "Ollama",
-                "openai_compatible" => "OpenAI-compatible",
-                other => other,
-            };
-            println!("  Provider: {}", display);
+            println!("  Provider: {}", llm_provider_display(provider));
         }
 
         if let Some(ref model) = self.settings.selected_model {
@@ -1673,6 +1797,66 @@ impl Default for SetupWizard {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_supported_inference_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "nearai" | "anthropic" | "openai" | "ollama" | "openai_compatible" | "x402"
+    )
+}
+
+fn llm_provider_display(provider: &str) -> &str {
+    match provider {
+        "nearai" => "NEAR AI",
+        "anthropic" => "Anthropic (Claude)",
+        "openai" => "OpenAI",
+        "ollama" => "Ollama (local)",
+        "openai_compatible" => "OpenAI-compatible endpoint",
+        "x402" => "x402 router (Base USDC)",
+        other => other,
+    }
+}
+
+fn normalize_evm_private_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let normalized = if let Some(rest) = trimmed.strip_prefix("0X") {
+        format!("0x{}", rest)
+    } else {
+        trimmed.to_string()
+    };
+
+    if normalized.len() != 66 || !normalized.starts_with("0x") {
+        return None;
+    }
+    if normalized
+        .as_bytes()
+        .iter()
+        .skip(2)
+        .all(|b| b.is_ascii_hexdigit())
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn is_valid_http_url(value: &str) -> bool {
+    match url::Url::parse(value) {
+        Ok(url) => matches!(url.scheme(), "http" | "https"),
+        Err(_) => false,
+    }
+}
+
+fn normalize_router_base_url(value: &str) -> Option<String> {
+    let mut normalized = value.trim().trim_end_matches('/').to_string();
+    if normalized.ends_with("/v1") {
+        normalized = normalized.trim_end_matches("/v1").to_string();
+    }
+    if normalized.is_empty() || !is_valid_http_url(&normalized) {
+        return None;
+    }
+    Some(normalized)
 }
 
 /// Mask password in a database URL for display.
@@ -2288,6 +2472,39 @@ mod tests {
         let channels =
             discover_wasm_channels(std::path::Path::new("/tmp/ironclaw_nonexistent_dir")).await;
         assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn test_provider_helpers_include_x402() {
+        assert!(is_supported_inference_provider("x402"));
+        assert_eq!(llm_provider_display("x402"), "x402 router (Base USDC)");
+    }
+
+    #[test]
+    fn test_collect_bootstrap_env_vars_includes_x402_fields() {
+        let mut wizard = SetupWizard::new();
+        wizard.settings.llm_backend = Some("x402".to_string());
+        wizard.settings.x402_base_url = Some("https://router.example.com".to_string());
+        wizard.settings.x402_rpc_url = Some("https://mainnet.base.org".to_string());
+        wizard.settings.x402_network = Some("eip155:8453".to_string());
+        wizard.settings.x402_permit_cap = Some("10000000".to_string());
+
+        let vars = wizard.collect_bootstrap_env_vars();
+        let map: std::collections::HashMap<&str, &str> =
+            vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        assert_eq!(
+            map.get("LLM_BACKEND"),
+            None,
+            "x402 backend is intentionally sourced from DB + secrets, not bootstrap env"
+        );
+        assert_eq!(
+            map.get("X402_BASE_URL"),
+            Some(&"https://router.example.com")
+        );
+        assert_eq!(map.get("X402_RPC_URL"), Some(&"https://mainnet.base.org"));
+        assert_eq!(map.get("X402_NETWORK"), Some(&"eip155:8453"));
+        assert_eq!(map.get("X402_PERMIT_CAP"), Some(&"10000000"));
     }
 
     /// RAII guard that sets/clears an env var for the duration of a test.
